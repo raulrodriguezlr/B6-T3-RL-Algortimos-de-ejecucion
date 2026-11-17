@@ -197,6 +197,13 @@ class DDQNAgent:
 class TWAP(DDQNAgent):
     """Agente determinista TWAP que mantiene el volumen restante alineado con el tiempo restante."""
 
+    def __init__(self, env: BestExecutionEnv, horizon: float = 1.0, **kwargs: Any) -> None:
+        """horizon < 1 comprime el calendario para terminar en esa fracción del tiempo (Ej. 4B)."""
+        super().__init__(env, **kwargs)
+        self.horizon = horizon
+
     def act(self, s: np.ndarray) -> int:
-        """Ejecuta compra (1) si el porcentaje de volumen pendiente iguala o supera al de tiempo."""
-        return 1 if float(s[1]) >= float(s[0]) else 0
+        """Compra (1) si el volumen pendiente iguala o supera al pendiente del plan; si no, espera."""
+        # tiempo restante del plan: 0 a partir de horizon
+        plan_time_left = max(0.0, (float(s[0]) - (1.0 - self.horizon)) / self.horizon)
+        return 1 if float(s[1]) >= plan_time_left else 0

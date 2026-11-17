@@ -23,3 +23,7 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Checkpoints de entrenamiento (Ej. 4C)
+results/ej4_checkpoints/
+*.pt

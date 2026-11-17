@@ -20,8 +20,26 @@ class BestExecutionEnv:
         max_pct_care: float = 0.125,
         done_penalty: float = -1.0,
         use_causal_vwap_reward: bool = False,
+        reward_mode: str = "vwap",
+        target_horizon: float = 1.0,
+        tracking_scale: float = 0.2,
+        pending_penalty: float = 2.0,
+        completion_discount: float = 0.9,
+        dev_band: float = 0.0,
+        price_weight: float = 0.0,
+        state_mode: str = "basic",
+        dev_clip: float = 5.0,
     ) -> None:
-        """Inicializa el entorno con los datos agrupados y parámetros de orden CARE."""
+        """Inicializa el entorno con los datos agrupados y parámetros de orden CARE.
+
+        reward_mode "vwap" es la recompensa del Ej. 1; "twap" penaliza la desviación frente al plan lineal (Ej. 2 y 4B).
+        """
+        if reward_mode not in ("vwap", "twap"):
+            raise ValueError(f"reward_mode desconocido: {reward_mode}")
+        if state_mode not in ("basic", "plan", "market"):
+            raise ValueError(f"state_mode desconocido: {state_mode}")
+        if not 0.0 < target_horizon <= 1.0:
+            raise ValueError("target_horizon debe estar en (0, 1]")
         self.data = data
         self.look_back = look_back
         self.min_bins = min_bins
@@ -30,6 +48,17 @@ class BestExecutionEnv:
         self.max_pct_care = max_pct_care
         self.done_penalty = done_penalty
         self.use_causal_vwap_reward = use_causal_vwap_reward
+        self.reward_mode = reward_mode
+        self.target_horizon = target_horizon
+        self.tracking_scale = tracking_scale
+        self.pending_penalty = pending_penalty
+        self.completion_discount = completion_discount
+        self.dev_band = dev_band
+        self.price_weight = price_weight
+        self.state_mode = state_mode
+        self.dev_clip = dev_clip
+        # global por defecto (compatible con set_seeds); reset(seed) usa uno propio
+        self._rng: Any = np.random
 
         self.episode_bins: int | None = None
         self.episode_full_len: int | None = None
@@ -61,6 +90,7 @@ class BestExecutionEnv:
         """Detecta la dimensión del vector de estado generado por observation_builder."""
         self._reset_env_episode_params()
         self._generate_episode()
+        self._compute_episode_market_feat()
         s = self.observation_builder()
         return int(s.shape[0])
 
@@ -84,10 +114,10 @@ class BestExecutionEnv:
     def _generate_episode_params(self) -> None:
         """(1) Determina aleatoriamente la duración del episodio y el volumen de la orden CARE."""
         self.episode_bins = int(
-            np.random.randint(low=self.min_bins, high=self.max_bins + 1)
+            self._rng.randint(low=self.min_bins, high=self.max_bins + 1)
         )
         pct_bins = float(
-            np.random.uniform(low=self.min_pct_care, high=self.max_pct_care)
+            self._rng.uniform(low=self.min_pct_care, high=self.max_pct_care)
         )
         self.vol_care = int(pct_bins * self.episode_bins)
         self.episode_full_len = self.episode_bins + self.look_back
@@ -105,9 +135,9 @@ class BestExecutionEnv:
         days = list(self.data.keys())
         length_episode = 0
         while length_episode != self.episode_full_len:
-            selected_day = np.random.choice(days)
+            selected_day = days[int(self._rng.randint(len(days)))]
             data_day = self.data[selected_day]
-            init_time = np.random.choice(data_day.index)
+            init_time = data_day.index[int(self._rng.randint(len(data_day)))]
 
             hour_pos = data_day.index.get_loc(init_time)
             if isinstance(hour_pos, slice):
@@ -125,18 +155,61 @@ class BestExecutionEnv:
             self.episode = data_day.iloc[int(hour_pos) : final_position].copy()
             length_episode = self.episode_full.shape[0]
 
-    def reset(self) -> np.ndarray:
-        """Reinicia el entorno para un nuevo episodio y devuelve la observación inicial."""
+    def reset(self, seed: int | None = None) -> np.ndarray:
+        """Reinicia el entorno; con seed el episodio es reproducible sin tocar el RNG global."""
         self._reset_env_episode_params()
-        self._generate_episode()
+        if seed is None:
+            self._generate_episode()
+        else:
+            self._rng = np.random.RandomState(seed)
+            try:
+                self._generate_episode()
+            finally:
+                self._rng = np.random
         self._compute_episode_market_feat()
         return self.observation_builder()
 
     def observation_builder(self) -> np.ndarray:
-        """(3) Construye el estado con porcentaje de tiempo restante y volumen restante."""
+        """(3) Construye el estado: tiempo y volumen restantes, desvío frente al plan ("plan") y libro ("market")."""
         time_left = (self.episode_bins - self.state_pos) / self.episode_bins
         vol_left = 1.0 - (self.exec_vol / self.vol_care)
-        return np.array([time_left, vol_left], dtype=np.float32)
+        if self.state_mode == "basic":
+            return np.array([time_left, vol_left], dtype=np.float32)
+        # desvío en títulos antes de actuar, acotado a [-1, 1]
+        dev = self.exec_vol - self._plan_volume(self.state_pos)
+        dev_feat = float(np.clip(dev / self.dev_clip, -1.0, 1.0))
+        if self.state_mode == "plan":
+            return np.array([time_left, vol_left, dev_feat], dtype=np.float32)
+        return np.array(
+            [time_left, vol_left, dev_feat, *self._market_features()], dtype=np.float32
+        )
+
+    def _market_features(
+        self,
+        spread_norm_bps: float = 5.0,
+        ret_window: int = 12,
+        ret_norm_bps: float = 10.0,
+    ) -> list[float]:
+        """Features causales del libro en el bin actual: spread, desequilibrio y tendencia de corto plazo."""
+        # episode_full arranca look_back bins antes: posición absoluta del bin actual
+        pos = self.look_back + self.state_pos
+        ask, bid = self._full_ask[pos], self._full_bid[pos]
+        mid = 0.5 * (ask + bid)
+        spread = float(np.clip((ask - bid) / mid * 1e4 / spread_norm_bps, 0.0, 3.0))
+        vb, va = float(self._full_vbid[pos]), float(self._full_vask[pos])
+        imbalance = (vb - va) / (vb + va) if vb + va > 0 else 0.0
+        mid_past = 0.5 * (self._full_ask[pos - ret_window] + self._full_bid[pos - ret_window])
+        ret = float(np.clip((mid / mid_past - 1.0) * 1e4 / ret_norm_bps, -3.0, 3.0))
+        return [spread, float(imbalance), ret]
+
+    def _plan_volume(self, pos: int) -> float:
+        """Títulos que el plan lineal lleva ejecutados tras pos steps (completo en target_horizon)."""
+        horizon = self.target_horizon * self.episode_bins
+        return float(self.vol_care * min(1.0, pos / horizon))
+
+    def plan_deviation(self) -> float:
+        """Desvío en títulos frente al plan tras el step actual (positivo: por delante)."""
+        return float(self.exec_vol - self._plan_volume(self.state_pos + 1))
 
     def _compute_episode_market_feat(self) -> tuple[float, pd.Series]:
         """(4) Calcula el volumen por bin y el VWAP de mercado del episodio completo."""
@@ -144,6 +217,18 @@ class BestExecutionEnv:
         # clip: cumvol tiene saltos negativos puntuales en los datos
         self.market_ep_vol = self.episode["cumvol"].diff().clip(lower=0)
         self.market_ep_vol.iloc[0] = 0.0
+        # caché numpy para los cálculos por step: _cum_*[k] = suma de los k primeros pares (mid[i-1], vol[i])
+        if self.state_mode == "market":
+            full = self.episode_full
+            self._full_ask = full["ask1"].values.astype(np.float64)
+            self._full_bid = full["bid1"].values.astype(np.float64)
+            self._full_vask = full["vask1"].values.astype(np.float64)
+            self._full_vbid = full["vbid1"].values.astype(np.float64)
+        self._mid = mid.values.astype(np.float64)
+        self._ask = self.episode["ask1"].values.astype(np.float64)
+        vol_next = self.market_ep_vol.values[1:].astype(np.float64)
+        self._cum_vol = np.concatenate([[0.0], np.cumsum(vol_next)])
+        self._cum_pv = np.concatenate([[0.0], np.cumsum(self._mid[:-1] * vol_next)])
         cum_vol = float(self.market_ep_vol.sum())
         if cum_vol == 0.0:
             self.episode_vwap = float(mid.mean())
@@ -156,18 +241,23 @@ class BestExecutionEnv:
 
     def _compute_market_vwap(self) -> float:
         """(5) Calcula el VWAP de mercado acumulado hasta el step actual sin fuga de futuro."""
-        mid_p = (self.episode["ask1"] + self.episode["bid1"]) / 2.0
-        v = self.market_ep_vol
-        # vol[i] se valora a mid[i-1] (mismo criterio que episode_vwap)
-        p_arr = mid_p.values[: self.state_pos]
-        v_arr = v.values[1 : self.state_pos + 1]
-        sum_vol = float(np.sum(v_arr))
+        # vol[i] se valora a mid[i-1] (mismo criterio que episode_vwap); sumas acumuladas cacheadas en (4)
+        pos = self.state_pos
+        sum_vol = float(self._cum_vol[pos])
         if sum_vol == 0.0:
-            return float(mid_p.values[self.state_pos])
-        return float(np.sum(p_arr * v_arr) / sum_vol)
+            return float(self._mid[pos])
+        return float(self._cum_pv[pos] / sum_vol)
 
     def _compute_reward(self, price: float, vol: float) -> float:
         """(6) Calcula la recompensa inmediata tras ejecutar una acción en el mercado."""
+        if self.reward_mode == "twap":
+            # error de seguimiento del calendario: denso y markoviano; dev_band da holgura sin coste
+            excess = max(0.0, abs(self.plan_deviation()) - self.dev_band)
+            reward = -self.tracking_scale * excess
+            if vol > 0 and self.price_weight != 0.0:
+                # Ej. 4A: premio en pbs por comprar por debajo del VWAP del episodio (señal ex post)
+                reward += self.price_weight * (self.episode_vwap - price) / self.episode_vwap * 1e4
+            return float(reward)
         if vol == 0:
             return 0.0
         ref_vwap = (
@@ -179,7 +269,7 @@ class BestExecutionEnv:
 
     def _agg_action(self) -> float:
         """(7) Ejecuta una compra agresiva de 1 título al mejor precio de venta (ask1)."""
-        price = float(self.episode["ask1"].values[self.state_pos])
+        price = float(self._ask[self.state_pos])
         vol = 1
         self.price_hist.append(price)
         self.exec_vol += vol
@@ -227,7 +317,19 @@ class BestExecutionEnv:
     def _compute_done_reward(self) -> float:
         """(12) Asigna recompensa adicional al cierre del episodio según si se completó la orden."""
         _, is_ord_complete = self._compute_stop_conditions()
-        return 0.0 if is_ord_complete else float(self.done_penalty)
+        if self.reward_mode == "vwap":
+            return 0.0 if is_ord_complete else float(self.done_penalty)
+        if not is_ord_complete:
+            pending = self.vol_care - self.exec_vol
+            return -self.tracking_scale * self.pending_penalty * float(pending)
+        # orden completa antes de tiempo: valor descontado del desvío de los steps restantes,
+        # el mismo que habría acumulado el episodio si siguiera sin decisiones
+        remaining = np.arange(self.state_pos + 1, self.episode_bins + 1)
+        horizon = self.target_horizon * self.episode_bins
+        plan = self.vol_care * np.minimum(1.0, remaining / horizon)
+        disc = self.completion_discount ** np.arange(1, len(remaining) + 1)
+        excess = np.maximum(0.0, self.vol_care - plan - self.dev_band)
+        return -self.tracking_scale * float(np.sum(disc * excess))
 
     def action_sample(self) -> int:
         """(13) Muestra una acción aleatoria ponderada por la tasa media de ejecución."""
