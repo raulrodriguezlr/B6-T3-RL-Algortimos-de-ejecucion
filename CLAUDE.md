@@ -97,7 +97,7 @@ src/execution_rl/
 notebooks/         # ej1, ej2, ej3, ej4 (o uno solo con secciones señaladas)
 tests/             # pytest, sin red
 results/           # figuras y tablas generadas
-data/              # pkl descomprimidos del zip (no se versionan)
+data/              # csv.gz convertidos de los pkl del zip (versionados, ~7 MB, para que el repo corra al clonarlo)
 ```
 
 Antes de crear nada hay que decidir con el usuario: notebook único frente a uno por ejercicio, y TF frente a PyTorch.
@@ -162,4 +162,5 @@ Buenas prácticas:
 - Opciones para el agente: portar `DDQNAgent` a PyTorch (permitido por el enunciado, es lo que encaja con el entorno actual) o crear un entorno Python 3.11 con TF. Decisión pendiente con el usuario.
 - **Datos (verificado 17/11/2026):** los `.pkl` originales (pandas 1.4) **no cargan** con pandas 3.0 ni 2.3 (`TypeError: ... 'placement' ... got slice`). Cargan con `pandas==1.4.0` + `numpy==1.22.4` en Python 3.10. Se convirtieron a `data/{rep,san}_{train,val,test}.csv.gz` (índice `time`, columnas `ask1, bid1, vask1, vbid1, last, cumvol, date`, sin NaN, 60/30/30 días, 3177 a 3181 bins por día). Se leen con `pd.read_csv(..., index_col="time", parse_dates=["time"])` y `groupby("date")` devuelve el dict de días que espera el entorno.
 - En el pickle original la clave de validación es `val`, no `validation`, y las claves de día son `datetime.date`.
+- Ejecutar el notebook con Python 3.14 explícito (el `jupyter` del PATH apunta a Python 3.13, sin torch): `cd notebooks && /c/Python314/python.exe -m nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=python3 ej1_entorno_y_entrenamiento.ipynb` (unos 20 s). Tests: `python -m pytest -q` desde la raíz.
 - Venvs temporales usados para la conversión (py3.12 y py3.10) en el scratchpad de la sesión; no forman parte del repo. El notebook base sigue sin ejecutarse (sus TODOs no están resueltos).
